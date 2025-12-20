@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["log"]
+default = ["log", "dry-run"]
 log = []
 zbus = ["rs-matter/zbus"]
 astro-dnssd = ["rs-matter/astro-dnssd"]
@@ -12,6 +12,7 @@ zeroconf = ["rs-matter/zeroconf"]
 avahi = ["rs-matter/zbus"]
 resolve = ["rs-matter/zbus"]
 chip-test = []
+dry-run = []
 
 [dependencies]
 log = "0.4"

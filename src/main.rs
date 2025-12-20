@@ -27,6 +27,9 @@ use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
 
+use std::sync::{LazyLock, Mutex, Arc, atomic::{AtomicBool, Ordering}};
+use std::time::Duration;
+
 use embassy_futures::select::{select3, select4};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 
@@ -76,16 +79,71 @@ static BUFFERS: StaticCell<PooledBuffers<10, NoopRawMutex, IMBuffer>> = StaticCe
 static SUBSCRIPTIONS: StaticCell<DefaultSubscriptions> = StaticCell::new();
 static PSM: StaticCell<Psm<4096>> = StaticCell::new();
 
+
 #[cfg(feature = "chip-test")]
 const PERSIST_FILE_NAME: &str = "/tmp/chip_kvs";
 
+
+
 fn main() -> Result<(), Error> {
+
+    // I don't know enough about threads and Rust to fully get this, but Copilot seems to think it works
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    let auto_brightness_thread = std::thread::Builder::new()
+        .name("auto-brightness".into())
+        .spawn(move || {
+            while r.load(Ordering::SeqCst) {
+                auto_brightness_thread_run();
+            }
+        })
+        .unwrap();
+
+    #[cfg(feature = "dry-run")]
+    let _als_spoof_thread = std::thread::Builder::new()
+        .spawn(move || {
+        let mut increasing = true;
+            loop {
+                if increasing {
+                    let mut als_value = AMBIENT_LIGHT_VALUE_DRY.lock().unwrap();
+                    *als_value += 5;
+                    if *als_value >= AMBIENT_LIGHT_SENSOR_MAX {
+                        increasing = false;
+                    }
+                } else {
+                    let mut als_value = AMBIENT_LIGHT_VALUE_DRY.lock().unwrap();
+                    *als_value -= 5;
+                    if *als_value <= 0 {
+                        increasing = true;
+                    }
+                }
+                // Sleep for a while
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        })
+        .unwrap();
+
     let thread = std::thread::Builder::new()
         .stack_size(550 * 1024)
         .spawn(run)
         .unwrap();
 
-    thread.join().unwrap()
+    // Wait on Matter thread, then if it crashes, just run the auto brightness thread forever
+    match thread.join() {
+        Ok(_) => running.store(false, Ordering::SeqCst),
+        Err(e) => {
+            error!("Matter thread exited with error: {:?}", e);
+        }
+    }
+
+    match auto_brightness_thread.join() {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            error!("Auto brightness thread exited with error: {:?}", e);
+            Err(Error::from(ErrorCode::Failure))
+        }
+    }
+
 }
 
 fn run() -> Result<(), Error> {
@@ -250,30 +308,33 @@ fn dm_handler<'a, OH: OnOffHooks>(
 // --- START: Backlight Control Configuration ---
 
 // **IMPORTANT:** Replace with your actual path.
+
 const BACKLIGHT_DEVICE_PATH: &str = "/sys/class/backlight/intel_backlight";
 const BRIGHTNESS_FILE: &str = "brightness";
 const MAX_BRIGHTNESS_FILE: &str = "max_brightness";
+const AMBIENT_LIGHT_SENSOR_PATH: &str = "/sys/bus/iio/devices/iio:device0/in_illuminance_raw";
 
-// Helper to read max brightness
-fn get_max_backlight() -> Result<u32, Error> {
-    let path = PathBuf::from(BACKLIGHT_DEVICE_PATH).join(MAX_BRIGHTNESS_FILE);
-    fs::read_to_string(path)
-        .map_err(|e| {
-            error!("Failed to read max_brightness: {}", e);
-            rs_matter::error::Error::from(ErrorCode::Failure)
-        })?
-        .trim()
-        .parse::<u32>()
-        .map_err(|e| {
-            error!("Failed to parse max_brightness: {}", e);
-            rs_matter::error::Error::from(ErrorCode::Failure)
-        })
-}
+// Max raw sensor value you expect (e.g., test in bright sunlight)
+const AMBIENT_LIGHT_SENSOR_MAX: u32 = 70;
+// Minimum brightness (1 is usually the lowest, not 0)
+const MIN_BRIGHTNESS: u32 = 1;
+// How aggressively to scale (0.1 - 1.0). Higher = brighter faster.
+// const SCALE_FACTOR: f32 = 0.7;
+
+static BACKLIGHT_VALUE_DRY: LazyLock<Mutex<u32>> = LazyLock::new(|| {
+    Mutex::new(100)
+});
+
+const BACKLIGHT_MAX_VALUE_DRY: u32 = 1000;
+
+static AMBIENT_LIGHT_VALUE_DRY: LazyLock<Mutex<u32>> = LazyLock::new(|| {
+    Mutex::new(100)
+});
+
 
 // --- END: Backlight Control Configuration ---
 
 // Implementing the OnOff business logic
-
 #[derive(Default)]
 struct OnOffPersistentState {
     on_off: bool,
@@ -316,7 +377,7 @@ const STORAGE_FILE_NAME: &str = "rs-matter-on-off-state";
 
 impl OnOffDeviceLogic {
     pub fn new() -> Self {
-        let max_brightness = get_max_backlight().unwrap_or(255);
+        let max_brightness = FilesystemHelpers::get_max_backlight().unwrap_or(255);
         info!("Max Backlight Brightness Detected: {}", max_brightness);
 
         let storage_path = std::env::temp_dir().join(STORAGE_FILE_NAME);
@@ -341,30 +402,7 @@ impl OnOffDeviceLogic {
         }
     }
 
-    // Helper to write brightness to the Linux file
-    fn write_backlight(&self, brightness: u32) -> Result<(), Error> {
-        let path = PathBuf::from(BACKLIGHT_DEVICE_PATH).join(BRIGHTNESS_FILE);
-        fs::write(path, brightness.to_string().as_bytes()).map_err(|e| {
-            error!("Failed to write to backlight file: {}", e);
-            rs_matter::error::Error::from(ErrorCode::Failure)
-        })
-    }
-
-    // Helper to read brightness from the Linux file
-    fn read_backlight(&self) -> Result<u32, Error> {
-        let path = PathBuf::from(BACKLIGHT_DEVICE_PATH).join(BRIGHTNESS_FILE);
-        fs::read_to_string(path)
-            .map_err(|e| {
-                error!("Failed to read from backlight file: {}", e);
-                rs_matter::error::Error::from(ErrorCode::Failure)
-            })?
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| {
-                error!("Failed to parse backlight value: {}", e);
-                rs_matter::error::Error::from(ErrorCode::Failure)
-            })
-    }
+    
 
     fn save_state(&self) -> Result<(), Error> {
         let mut file = fs::File::create(self.storage_path.as_path())?;
@@ -378,6 +416,7 @@ impl OnOffDeviceLogic {
         file.write_all(&[value])?;
         Ok(())
     }
+
 }
 
 impl OnOffHooks for OnOffDeviceLogic {
@@ -402,7 +441,7 @@ impl OnOffHooks for OnOffDeviceLogic {
         ));
 
     fn on_off(&self) -> bool {
-        match self.read_backlight() {
+        match FilesystemHelpers::read_backlight() {
             Ok(brightness) => brightness > 0,
             Err(e) => {
                 error!("Error reading backlight for OnOff state: {:?}", e);
@@ -417,7 +456,9 @@ impl OnOffHooks for OnOffDeviceLogic {
         // If ON, set to max_brightness. If OFF, set to 0.
         let target_brightness = if on { self.max_brightness } else { 0 };
 
-        if let Err(err) = self.write_backlight(target_brightness) {
+        info!("Backlight value is: {target_brightness}");
+
+        if let Err(err) = FilesystemHelpers::write_backlight(target_brightness) {
             error!("Error setting backlight for OnOff: {}", err);
         }
 
@@ -440,5 +481,151 @@ impl OnOffHooks for OnOffDeviceLogic {
 
     async fn handle_off_with_effect(&self, _effect: on_off::EffectVariantEnum) {
         // no effect
+    }
+}
+
+// Filesystem helpers
+struct FilesystemHelpers;
+impl FilesystemHelpers {
+    // Helper to read max brightness
+    fn get_max_backlight() -> Result<u32, Error> {
+
+        #[cfg(feature = "dry-run")]
+        return Ok(BACKLIGHT_MAX_VALUE_DRY);
+
+        let path = PathBuf::from(BACKLIGHT_DEVICE_PATH).join(MAX_BRIGHTNESS_FILE);
+        fs::read_to_string(path)
+            .map_err(|e| {
+                error!("Failed to read max_brightness: {}", e);
+                rs_matter::error::Error::from(ErrorCode::Failure)
+            })?
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| {
+                error!("Failed to parse max_brightness: {}", e);
+                rs_matter::error::Error::from(ErrorCode::Failure)
+            })
+    }
+
+    // Helper to write brightness to the Linux file
+    fn write_backlight(brightness: u32) -> Result<(), Error> {
+
+        #[cfg(feature = "dry-run")]
+        {
+            *BACKLIGHT_VALUE_DRY.lock().unwrap() = brightness;
+            return Ok(());
+        }
+
+        let path = PathBuf::from(BACKLIGHT_DEVICE_PATH).join(BRIGHTNESS_FILE);
+        fs::write(path, brightness.to_string().as_bytes()).map_err(|e| {
+            error!("Failed to write to backlight file: {}", e);
+            rs_matter::error::Error::from(ErrorCode::Failure)
+        })
+    }
+
+
+    // Helper to read brightness from the Linux file
+    fn read_backlight() -> Result<u32, Error> {
+
+        #[cfg(feature = "dry-run")]
+        {
+            let value = *BACKLIGHT_VALUE_DRY.lock().unwrap();
+            return Ok(value);
+        }
+
+        let path = PathBuf::from(BACKLIGHT_DEVICE_PATH).join(BRIGHTNESS_FILE);
+        fs::read_to_string(path)
+            .map_err(|e| {
+                error!("Failed to read from backlight file: {}", e);
+                rs_matter::error::Error::from(ErrorCode::Failure)
+            })?
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| {
+                error!("Failed to parse backlight value: {}", e);
+                rs_matter::error::Error::from(ErrorCode::Failure)
+            })
+    }
+
+    // Helper to read ambient light sensor value from the Linux file
+    fn read_ambient_light_sensor() -> Result<u32, Error> {
+
+        #[cfg(feature = "dry-run")]
+        {
+            let value = *AMBIENT_LIGHT_VALUE_DRY.lock().unwrap();
+            return Ok(value);
+        }
+
+        let path = PathBuf::from(AMBIENT_LIGHT_SENSOR_PATH);
+        fs::read_to_string(path)
+            .map_err(|e| {
+                error!("Failed to read from ambient light sensor file: {}", e);
+                rs_matter::error::Error::from(ErrorCode::Failure)
+            })?
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| {
+                error!("Failed to parse ambient light sensor value: {}", e);
+                rs_matter::error::Error::from(ErrorCode::Failure)
+            })
+    }
+}
+
+
+// Ambient Light Sensor Stuff
+// Blocking loop that does all the work for auto brightness
+fn auto_brightness_thread_run() {
+
+    let mut prev_smoothed_value = FilesystemHelpers::read_ambient_light_sensor().unwrap_or(0) as f32;
+    
+    fn loop_runner(prev_smoothed_value: &mut f32) -> Result<(), Error> {
+
+        let alpha = 0.2;
+
+        let backlight_max_value = FilesystemHelpers::get_max_backlight()?;
+
+        let sensor_value = FilesystemHelpers::read_ambient_light_sensor()?;
+        let brightness_range = backlight_max_value - MIN_BRIGHTNESS;
+        // Scale sensor value to brightness
+        let mut scaled_brightness = (MIN_BRIGHTNESS as f32 + ((sensor_value as f32 / AMBIENT_LIGHT_SENSOR_MAX as f32)
+            * (brightness_range as f32))) as u32;
+
+        // Clamp to min and max
+        if scaled_brightness < MIN_BRIGHTNESS {
+            scaled_brightness = MIN_BRIGHTNESS;
+        } else if scaled_brightness > backlight_max_value {
+            scaled_brightness = backlight_max_value;
+        }
+
+        // Apply EWMA
+        let smoothed_value = alpha * (scaled_brightness as f32)
+            + (1.0 - alpha) * *prev_smoothed_value;
+        *prev_smoothed_value = smoothed_value;
+
+        info!(
+            "Ambient light sensor: {}, setting brightness to: {}",
+            sensor_value, smoothed_value
+        );
+
+
+        if let Err(err) = FilesystemHelpers::write_backlight(smoothed_value as u32) {
+            error!("Error setting backlight for auto brightness: {}", err);
+        }
+
+        Ok(())
+    }
+
+    loop {
+        match loop_runner(&mut prev_smoothed_value) {
+            Ok(()) => {
+                ()
+            }
+            Err(e) => {
+                error!("Error reading ambient light sensor: {:?}", e);
+            }
+        }
+
+        // Sleep for a while before next reading
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
