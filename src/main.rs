@@ -22,10 +22,12 @@
 use core::cell::Cell;
 use core::pin::pin;
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
+use std::env;
+
 
 use std::sync::{LazyLock, Mutex, Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
@@ -34,19 +36,21 @@ use embassy_futures::select::{select3, select4};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 
 use async_signal::{Signal, Signals};
-// REMOVED 'trace' to fix the warning
-use log::{error, info}; 
+use log::{error, info, debug}; 
 
 use futures_lite::StreamExt;
+
+use rs_matter::dm::clusters::decl::level_control::{
+    AttributeId, CommandId, OptionsBitmap, FULL_CLUSTER as LEVEL_CONTROL_FULL_CLUSTER,
+};
 
 use rs_matter::dm::clusters::decl::on_off as on_off_cluster;
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter::dm::clusters::net_comm::NetworkType;
-// ADDED NoLevelControl import here
-use rs_matter::dm::clusters::on_off::NoLevelControl; 
+use rs_matter::dm::clusters::level_control::{self, LevelControlHooks};
 use rs_matter::dm::clusters::on_off::{self, OnOffHooks, StartUpOnOffEnum};
 use rs_matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
-use rs_matter::dm::devices::DEV_TYPE_ON_OFF_LIGHT;
+use rs_matter::dm::devices::DEV_TYPE_DIMMABLE_LIGHT;
 use rs_matter::dm::endpoints;
 use rs_matter::dm::networks::unix::UnixNetifs;
 use rs_matter::dm::subscriptions::DefaultSubscriptions;
@@ -74,58 +78,79 @@ use static_cell::StaticCell;
 mod mdns;
 
 // Statically allocate in BSS the bigger objects
+// `rs-matter` supports efficient initialization of BSS objects (with `init`)
+// as well as just allocating the objects on-stack or on the heap.
 static MATTER: StaticCell<Matter> = StaticCell::new();
 static BUFFERS: StaticCell<PooledBuffers<10, NoopRawMutex, IMBuffer>> = StaticCell::new();
 static SUBSCRIPTIONS: StaticCell<DefaultSubscriptions> = StaticCell::new();
 static PSM: StaticCell<Psm<4096>> = StaticCell::new();
 
-
-#[cfg(feature = "chip-test")]
-const PERSIST_FILE_NAME: &str = "/tmp/chip_kvs";
-
-
-
 fn main() -> Result<(), Error> {
+
+    let args: Vec<String> = env::args().collect();
+    let parsed_args = parse_args(&args);
+
+    // Initialize logging
+    env_logger::init_from_env(
+        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+    );
+
+    let filesystem_manager = Arc::new(FilesystemManager { no_filesystem: parsed_args.no_filesystem });
 
     // I don't know enough about threads and Rust to fully get this, but Copilot seems to think it works
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
+    let auto_brightness_filesystem_manager = filesystem_manager.clone();
     let auto_brightness_thread = std::thread::Builder::new()
         .name("auto-brightness".into())
         .spawn(move || {
             while r.load(Ordering::SeqCst) {
-                auto_brightness_thread_run();
+                auto_brightness_thread_run(auto_brightness_filesystem_manager.clone());
             }
         })
         .unwrap();
 
-    #[cfg(feature = "dry-run")]
-    let _als_spoof_thread = std::thread::Builder::new()
-        .spawn(move || {
-        let mut increasing = true;
-            loop {
-                if increasing {
-                    let mut als_value = AMBIENT_LIGHT_VALUE_DRY.lock().unwrap();
-                    *als_value += 5;
-                    if *als_value >= AMBIENT_LIGHT_SENSOR_MAX {
-                        increasing = false;
+    if parsed_args.no_filesystem {
+        info!("Running in no-filesystem mode. No actual filesystem changes will be made, and system files will not be accessed.");
+        if parsed_args.no_als_spoof {
+            info!("Ambient light sensor spoofing disabled.");
+        } else {
+            info!("Ambient light sensor spoofing enabled.");
+        }
+    }
+
+    if parsed_args.no_filesystem && !parsed_args.no_als_spoof {
+        info!("Starting ambient light sensor spoofing thread.");
+        let _als_spoof_thread = std::thread::Builder::new()
+            .spawn(move || {
+            let mut increasing = true;
+                loop {
+                    if increasing {
+                        let mut als_value = AMBIENT_LIGHT_VALUE_DRY.lock().unwrap();
+                        *als_value += 5;
+                        if *als_value >= AMBIENT_LIGHT_SENSOR_MAX {
+                            increasing = false;
+                        }
+                    } else {
+                        let mut als_value = AMBIENT_LIGHT_VALUE_DRY.lock().unwrap();
+                        *als_value -= 5;
+                        if *als_value <= 0 {
+                            increasing = true;
+                        }
                     }
-                } else {
-                    let mut als_value = AMBIENT_LIGHT_VALUE_DRY.lock().unwrap();
-                    *als_value -= 5;
-                    if *als_value <= 0 {
-                        increasing = true;
-                    }
+                    // Sleep for a while
+                    std::thread::sleep(Duration::from_secs(10));
                 }
-                // Sleep for a while
-                std::thread::sleep(Duration::from_secs(10));
-            }
-        })
-        .unwrap();
+            })
+            .unwrap();
+    }
+
+    let matter_filesystem_manager = filesystem_manager.clone();
 
     let thread = std::thread::Builder::new()
+        // Increase the stack size until the example can work without stack blowups.
         .stack_size(550 * 1024)
-        .spawn(run)
+        .spawn(move || run(matter_filesystem_manager.clone()))
         .unwrap();
 
     // Wait on Matter thread, then if it crashes, just run the auto brightness thread forever
@@ -146,21 +171,19 @@ fn main() -> Result<(), Error> {
 
 }
 
-fn run() -> Result<(), Error> {
-    #[cfg(not(feature = "chip-test"))]
-    env_logger::init_from_env(
-        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
-    );
+struct Args {
+    no_filesystem: bool,
+    no_als_spoof: bool
+}
 
-    #[cfg(feature = "chip-test")]
-    env_logger::builder()
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(buf, "{}: {}", record.level(), record.args())
-        })
-        .target(env_logger::Target::Stdout)
-        .filter_level(::log::LevelFilter::Debug)
-        .init();
+fn parse_args(args: &[String]) -> Args {
+    Args {
+        no_filesystem: args.contains(&String::from("--no-filesystem")),
+        no_als_spoof: args.contains(&String::from("--no-als-spoof")),
+    }
+}
+fn run(filesystem_manager: Arc<FilesystemManager>) -> Result<(), Error> {
+
 
     info!(
         "Matter memory: Matter (BSS)={}B, IM Buffers (BSS)={}B, Subscriptions (BSS)={}B",
@@ -178,27 +201,47 @@ fn run() -> Result<(), Error> {
         MATTER_PORT,
     ));
 
+    // Need to call this once
     matter.initialize_transport_buffers()?;
 
+    // Create the transport buffers
     let buffers = BUFFERS.uninit().init_with(PooledBuffers::init(0));
 
+    // Create the subscriptions
     let subscriptions = SUBSCRIPTIONS
         .uninit()
         .init_with(DefaultSubscriptions::init());
 
+    // LevelControl cluster setup
+    let level_control_handler = level_control::LevelControlHandler::new(
+        Dataver::new_rand(matter.rand()),
+        1,
+        LevelControlDeviceLogic::new(filesystem_manager.clone()),
+        level_control::AttributeDefaults {
+            on_level: Nullable::some(42),
+            options: OptionsBitmap::from_bits(OptionsBitmap::EXECUTE_IF_OFF.bits()).unwrap(),
+            ..Default::default()
+        },
+    );
+
     // OnOff cluster setup
-    // Compiler infers the second generic type is NoLevelControl because of dm_handler signature
     let on_off_handler =
-        on_off::OnOffHandler::new(Dataver::new_rand(matter.rand()), 1, OnOffDeviceLogic::new());
+        on_off::OnOffHandler::new(Dataver::new_rand(matter.rand()), 1, OnOffDeviceLogic::new(filesystem_manager.clone()));
+
+    // Cluster wiring, validation and initialisation
+    on_off_handler.init(Some(&level_control_handler));
+    level_control_handler.init(Some(&on_off_handler));
 
     // Create the Data Model instance
     let dm = DataModel::new(
         matter,
         buffers,
         subscriptions,
-        dm_handler(matter, &on_off_handler),
+        dm_handler(matter, &on_off_handler, &level_control_handler),
     );
 
+    // Create a default responder capable of handling up to 3 subscriptions
+    // All other subscription requests will be turned down with "resource exhausted"
     let responder = DefaultResponder::new(&dm);
     info!(
         "Responder memory: Responder (stack)={}B, Runner fut (stack)={}B",
@@ -206,7 +249,11 @@ fn run() -> Result<(), Error> {
         core::mem::size_of_val(&responder.run::<4, 4>())
     );
 
+    // Run the responder with up to 4 handlers (i.e. 4 exchanges can be handled simultaneously)
+    // Clients trying to open more exchanges than the ones currently running will get "I'm busy, please try again later"
     let mut respond = pin!(responder.run::<4, 4>());
+    
+    // Run the background job of the data model
     let mut dm_job = pin!(dm.run());
 
     let socket = async_io::Async::<UdpSocket>::bind(MATTER_SOCKET_BIND_ADDR)?;
@@ -217,14 +264,13 @@ fn run() -> Result<(), Error> {
         core::mem::size_of_val(&mdns::run_mdns(matter))
     );
 
+    // Run the Matter and mDNS transports
     let mut mdns = pin!(mdns::run_mdns(matter));
     let mut transport = pin!(matter.run(&socket, &socket));
 
+    // Create, load and run the persister
     let psm = PSM.uninit().init_with(Psm::init());
-    #[cfg(not(feature = "chip-test"))]
     let path = std::env::temp_dir().join("rs-matter");
-    #[cfg(feature = "chip-test")]
-    let path = PathBuf::from(PERSIST_FILE_NAME);
 
     info!(
         "Persist memory: Persist (BSS)={}B, Persist fut (stack)={}B, Persist path={}",
@@ -238,18 +284,22 @@ fn run() -> Result<(), Error> {
     matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
 
     if !matter.is_commissioned() {
+        // If the device is not commissioned yet, print the QR code to the console
+        // and enable basic commissioning
         matter.print_standard_qr_code(QrTextType::Unicode, DiscoveryCapabilities::IP)?;
         matter.open_basic_comm_window(MAX_COMM_WINDOW_TIMEOUT_SECS)?;
     }
 
     let mut persist = pin!(psm.run(&path, matter, NO_NETWORKS));
 
+    // Listen to SIGTERM because at the end of the test we'll receive it
     let mut term_signal = Signals::new([Signal::Term])?;
     let mut term = pin!(async {
         term_signal.next().await;
         Ok(())
     });
 
+    // Combine all async tasks in a single one
     let all = select4(
         &mut transport,
         &mut mdns,
@@ -257,6 +307,7 @@ fn run() -> Result<(), Error> {
         select3(&mut respond, &mut dm_job, &mut term).coalesce(),
     );
 
+    // Run with a simple `block_on`. Any local executor would do.
     futures_lite::future::block_on(all.coalesce())
 }
 
@@ -267,20 +318,22 @@ const NODE: Node<'static> = Node {
         endpoints::root_endpoint(NetworkType::Ethernet),
         Endpoint {
             id: 1,
-            device_types: devices!(DEV_TYPE_ON_OFF_LIGHT),
+            device_types: devices!(DEV_TYPE_DIMMABLE_LIGHT),
             clusters: clusters!(
                 desc::DescHandler::CLUSTER,
                 OnOffDeviceLogic::CLUSTER,
+                LevelControlDeviceLogic::CLUSTER,
             ),
         },
     ],
 };
 
 /// The Data Model handler + meta-data for our Matter device.
-fn dm_handler<'a, OH: OnOffHooks>(
+/// The handler is the root endpoint 0 handler plus the on-off handler and its descriptor.
+fn dm_handler<'a, LH: LevelControlHooks, OH: OnOffHooks>(
     matter: &'a Matter<'a>,
-    // CHANGED: Use NoLevelControl instead of ()
-    on_off: &'a on_off::OnOffHandler<'a, OH, NoLevelControl>, 
+    on_off: &'a on_off::OnOffHandler<'a, OH, LH>,
+    level_control: &'a level_control::LevelControlHandler<'a, LH, OH>,
 ) -> impl AsyncMetadata + AsyncHandler + 'a {
     (
         NODE,
@@ -299,6 +352,9 @@ fn dm_handler<'a, OH: OnOffHooks>(
                     .chain(
                         EpClMatcher::new(Some(1), Some(OnOffDeviceLogic::CLUSTER.id)),
                         on_off::HandlerAsyncAdaptor(on_off),
+                    ).chain(
+                        EpClMatcher::new(Some(1), Some(LevelControlDeviceLogic::CLUSTER.id)),
+                        level_control::HandlerAsyncAdaptor(level_control),
                     ),
             ),
         ),
@@ -317,7 +373,7 @@ const AMBIENT_LIGHT_SENSOR_PATH: &str = "/sys/bus/iio/devices/iio:device0/in_ill
 // Max raw sensor value you expect (e.g., test in bright sunlight)
 const AMBIENT_LIGHT_SENSOR_MAX: u32 = 70;
 // Minimum brightness (1 is usually the lowest, not 0)
-const MIN_BRIGHTNESS: u32 = 1;
+const MIN_BRIGHTNESS: u32 = 5;
 // How aggressively to scale (0.1 - 1.0). Higher = brighter faster.
 // const SCALE_FACTOR: f32 = 0.7;
 
@@ -328,11 +384,141 @@ static BACKLIGHT_VALUE_DRY: LazyLock<Mutex<u32>> = LazyLock::new(|| {
 const BACKLIGHT_MAX_VALUE_DRY: u32 = 1000;
 
 static AMBIENT_LIGHT_VALUE_DRY: LazyLock<Mutex<u32>> = LazyLock::new(|| {
-    Mutex::new(100)
+    Mutex::new(50)
+});
+
+static AMBIENT_LIGHT_RATIO: LazyLock<Mutex<f32>> = LazyLock::new(|| {
+    Mutex::new(1.0)
+});
+
+static MATTER_BRIGHTNESS_RATIO: LazyLock<Mutex<f32>> = LazyLock::new(|| {
+    Mutex::new(1.0)
 });
 
 
 // --- END: Backlight Control Configuration ---
+
+
+// Implementing the LevelControl business logic
+pub struct LevelControlDeviceLogic {
+    start_up_current_level: Cell<Option<u8>>,
+    max_brightness: u32,
+    filesystem_manager: Arc<FilesystemManager>,
+}
+
+impl Default for LevelControlDeviceLogic {
+    fn default() -> Self {
+        Self::new(Arc::new(FilesystemManager { no_filesystem: false }))
+    }
+}
+
+impl LevelControlDeviceLogic {
+    pub fn new(filesystem_manager: Arc<FilesystemManager>) -> Self {
+        let max_brightness = filesystem_manager.get_max_backlight().unwrap_or(255); // Fallback to 255
+        info!("Max Backlight Brightness Detected: {}", max_brightness);
+
+        Self {
+            start_up_current_level: Cell::new(None),
+            filesystem_manager,
+            max_brightness,
+        }
+    }
+}
+
+impl LevelControlHooks for LevelControlDeviceLogic {
+    const MIN_LEVEL: u8 = 1;
+    const MAX_LEVEL: u8 = 254;
+    const FASTEST_RATE: u8 = 50;
+    const CLUSTER: Cluster<'static> = LEVEL_CONTROL_FULL_CLUSTER
+        .with_features(
+            level_control::Feature::LIGHTING.bits() | level_control::Feature::ON_OFF.bits(),
+        )
+        .with_attrs(with!(
+            required;
+            AttributeId::CurrentLevel
+            | AttributeId::RemainingTime
+            | AttributeId::MinLevel
+            | AttributeId::MaxLevel
+            | AttributeId::OnOffTransitionTime
+            | AttributeId::OnLevel
+            | AttributeId::OnTransitionTime
+            | AttributeId::OffTransitionTime
+            | AttributeId::DefaultMoveRate
+            | AttributeId::Options
+            | AttributeId::StartUpCurrentLevel
+        ))
+        .with_cmds(with!(
+            CommandId::MoveToLevel
+                | CommandId::Move
+                | CommandId::Step
+                | CommandId::Stop
+                | CommandId::MoveToLevelWithOnOff
+                | CommandId::MoveWithOnOff
+                | CommandId::StepWithOnOff
+                | CommandId::StopWithOnOff
+        ));
+
+    fn set_device_level(&self, level: u8) -> Result<Option<u8>, ()> {
+        // Actually do the thing
+
+        // Get the auto brightness level
+        let ambient_light_ratio = match AMBIENT_LIGHT_RATIO.lock() {
+            Ok(value) => *value,
+            Err(_) => 1.0
+        };
+        let matter_ratio = level as f32/255.0;
+        // Store the ratio for the auto brightness part to use
+        match MATTER_BRIGHTNESS_RATIO.lock() {
+            Ok(mut value) => *value = matter_ratio,
+            Err(_) => {error!("Could not set Matter brightness ratio variable")}
+        };
+
+
+        let scaled_brightness_result = self.filesystem_manager.map_matter_and_ambient_light_to_brightness(matter_ratio, ambient_light_ratio);
+        if let Err(err) = scaled_brightness_result {
+            error!("Could not calculate scaled brightness");
+            return Err(());
+        }
+
+        let scaled_brightness = scaled_brightness_result.unwrap();
+
+        let write_result = self.filesystem_manager.write_backlight(scaled_brightness as u32);
+
+        if let Err(err) = write_result {
+            error!("Failed to write backlight brightness: {}", err);
+            return Err(());
+        }
+
+        info!("LevelControl: Matter Level {level} and ambient light ratio {ambient_light_ratio} mapped to Backlight Brightness {scaled_brightness}");
+        Ok(Some(level))
+    }
+
+    fn current_level(&self) -> Option<u8> {
+        match MATTER_BRIGHTNESS_RATIO.lock() {
+            Ok(brightness) => {
+                Some((*brightness * 255.0) as u8)
+            },
+            Err(e) => {
+                error!("Error reading current backlight brightness: {:?}", e);
+                None
+            }
+        }
+    }
+
+    // set_current_level is now a no-op as state is read from the device
+    fn set_current_level(&self, _level: Option<u8>) {
+        // State is now managed by reading the backlight file in `current_level`
+    }
+
+    fn start_up_current_level(&self) -> Result<Option<u8>, Error> {
+        Ok(self.start_up_current_level.get())
+    }
+
+    fn set_start_up_current_level(&self, value: Option<u8>) -> Result<(), Error> {
+        self.start_up_current_level.set(value);
+        Ok(())
+    }
+}
 
 // Implementing the OnOff business logic
 #[derive(Default)]
@@ -371,13 +557,14 @@ pub struct OnOffDeviceLogic {
     start_up_on_off: Cell<Option<StartUpOnOffEnum>>,
     storage_path: PathBuf,
     max_brightness: u32,
+    filesystem_manager: Arc<FilesystemManager>,
 }
 
 const STORAGE_FILE_NAME: &str = "rs-matter-on-off-state";
 
 impl OnOffDeviceLogic {
-    pub fn new() -> Self {
-        let max_brightness = FilesystemHelpers::get_max_backlight().unwrap_or(255);
+    pub fn new(filesystem_manager: Arc<FilesystemManager>) -> Self {
+        let max_brightness = filesystem_manager.get_max_backlight().unwrap_or(255);
         info!("Max Backlight Brightness Detected: {}", max_brightness);
 
         let storage_path = std::env::temp_dir().join(STORAGE_FILE_NAME);
@@ -399,6 +586,7 @@ impl OnOffDeviceLogic {
             start_up_on_off: Cell::new(persisted_state.start_up_on_off),
             storage_path,
             max_brightness,
+            filesystem_manager,
         }
     }
 
@@ -407,13 +595,17 @@ impl OnOffDeviceLogic {
     fn save_state(&self) -> Result<(), Error> {
         let mut file = fs::File::create(self.storage_path.as_path())?;
 
-        // We persist 'false' for on_off because we read actual state from hardware
+        // Use a dummy 'on_off' value (false) as the real on/off is derived from backlight level.
+        // We only persist the `start_up_on_off`.
         let value = OnOffPersistentState::to_bytes_from_values(
             false, 
             self.start_up_on_off.get(),
         );
 
-        file.write_all(&[value])?;
+        let buf = &[value];
+
+        file.write_all(buf)?;
+
         Ok(())
     }
 
@@ -441,7 +633,7 @@ impl OnOffHooks for OnOffDeviceLogic {
         ));
 
     fn on_off(&self) -> bool {
-        match FilesystemHelpers::read_backlight() {
+        match self.filesystem_manager.read_backlight() {
             Ok(brightness) => brightness > 0,
             Err(e) => {
                 error!("Error reading backlight for OnOff state: {:?}", e);
@@ -458,7 +650,7 @@ impl OnOffHooks for OnOffDeviceLogic {
 
         info!("Backlight value is: {target_brightness}");
 
-        if let Err(err) = FilesystemHelpers::write_backlight(target_brightness) {
+        if let Err(err) = self.filesystem_manager.write_backlight(target_brightness) {
             error!("Error setting backlight for OnOff: {}", err);
         }
 
@@ -485,13 +677,17 @@ impl OnOffHooks for OnOffDeviceLogic {
 }
 
 // Filesystem helpers
-struct FilesystemHelpers;
-impl FilesystemHelpers {
-    // Helper to read max brightness
-    fn get_max_backlight() -> Result<u32, Error> {
+struct FilesystemManager {
+    no_filesystem: bool,
+}
 
-        #[cfg(feature = "dry-run")]
-        return Ok(BACKLIGHT_MAX_VALUE_DRY);
+impl FilesystemManager {
+    // Helper to read max brightness
+    fn get_max_backlight(&self) -> Result<u32, Error> {
+
+        if self.no_filesystem {
+            return Ok(BACKLIGHT_MAX_VALUE_DRY);
+        }
 
         let path = PathBuf::from(BACKLIGHT_DEVICE_PATH).join(MAX_BRIGHTNESS_FILE);
         fs::read_to_string(path)
@@ -508,10 +704,9 @@ impl FilesystemHelpers {
     }
 
     // Helper to write brightness to the Linux file
-    fn write_backlight(brightness: u32) -> Result<(), Error> {
+    fn write_backlight(&self, brightness: u32) -> Result<(), Error> {
 
-        #[cfg(feature = "dry-run")]
-        {
+        if self.no_filesystem {
             *BACKLIGHT_VALUE_DRY.lock().unwrap() = brightness;
             return Ok(());
         }
@@ -525,10 +720,9 @@ impl FilesystemHelpers {
 
 
     // Helper to read brightness from the Linux file
-    fn read_backlight() -> Result<u32, Error> {
+    fn read_backlight(&self) -> Result<u32, Error> {
 
-        #[cfg(feature = "dry-run")]
-        {
+        if self.no_filesystem {
             let value = *BACKLIGHT_VALUE_DRY.lock().unwrap();
             return Ok(value);
         }
@@ -548,10 +742,9 @@ impl FilesystemHelpers {
     }
 
     // Helper to read ambient light sensor value from the Linux file
-    fn read_ambient_light_sensor() -> Result<u32, Error> {
+    fn read_ambient_light_sensor(&self) -> Result<u32, Error> {
 
-        #[cfg(feature = "dry-run")]
-        {
+        if self.no_filesystem {
             let value = *AMBIENT_LIGHT_VALUE_DRY.lock().unwrap();
             return Ok(value);
         }
@@ -569,46 +762,70 @@ impl FilesystemHelpers {
                 rs_matter::error::Error::from(ErrorCode::Failure)
             })
     }
+
+    fn map_matter_and_ambient_light_to_brightness(&self, matter_ratio: f32, ambient_light_ratio: f32) -> Result<f32, Error> {
+
+        if matter_ratio <= 0.0 {
+            return Ok(0.0);
+        }
+
+        let backlight_max_value = self.get_max_backlight()?;
+        let brightness_range = backlight_max_value - MIN_BRIGHTNESS;
+
+        // Scale sensor value to brightness
+        let mut scaled_brightness = (MIN_BRIGHTNESS as f32 + (matter_ratio * ambient_light_ratio * (brightness_range as f32))) as f32;
+
+        // Clamp to min and max
+        if scaled_brightness < MIN_BRIGHTNESS as f32 {
+            scaled_brightness = MIN_BRIGHTNESS as f32;
+        } else if scaled_brightness > backlight_max_value as f32 {
+            scaled_brightness = backlight_max_value as f32;
+        }
+
+        Ok(scaled_brightness)
+    }
 }
 
 
 // Ambient Light Sensor Stuff
 // Blocking loop that does all the work for auto brightness
-fn auto_brightness_thread_run() {
+fn auto_brightness_thread_run(filesystem_manager: Arc<FilesystemManager>) {
 
-    let mut prev_smoothed_value = FilesystemHelpers::read_ambient_light_sensor().unwrap_or(0) as f32;
+
+
+    let mut prev_smoothed_value = filesystem_manager.read_ambient_light_sensor().unwrap_or(0) as f32;
     
-    fn loop_runner(prev_smoothed_value: &mut f32) -> Result<(), Error> {
+    fn loop_runner(prev_smoothed_value: &mut f32, filesystem_manager: Arc<FilesystemManager>) -> Result<(), Error> {
 
         let alpha = 0.2;
 
-        let backlight_max_value = FilesystemHelpers::get_max_backlight()?;
+        let sensor_value = filesystem_manager.read_ambient_light_sensor()?;
+        // Apply EWMA to sensor value
+        let smoothed_sensor_value = alpha * (sensor_value as f32) + (1.0 - alpha) * *prev_smoothed_value;
+        *prev_smoothed_value = smoothed_sensor_value;
+        
+        // Max the value at 1.0
+        let ambient_light_ratio = 1.0_f32.min(smoothed_sensor_value as f32 / AMBIENT_LIGHT_SENSOR_MAX as f32);
+        // Store the ratio for the matter side to use
+        match AMBIENT_LIGHT_RATIO.lock() {
+            Ok(mut value) => *value = ambient_light_ratio,
+            Err(_) => {error!("Could not set ambient light ratio variable")}
+        };
 
-        let sensor_value = FilesystemHelpers::read_ambient_light_sensor()?;
-        let brightness_range = backlight_max_value - MIN_BRIGHTNESS;
-        // Scale sensor value to brightness
-        let mut scaled_brightness = (MIN_BRIGHTNESS as f32 + ((sensor_value as f32 / AMBIENT_LIGHT_SENSOR_MAX as f32)
-            * (brightness_range as f32))) as u32;
+        // Retrieve the matter ratio or default to 1.0 if we can't
+        let matter_brightness = match MATTER_BRIGHTNESS_RATIO.lock() {
+            Ok(value) => *value,
+            Err(_) => 1.0
+        };
 
-        // Clamp to min and max
-        if scaled_brightness < MIN_BRIGHTNESS {
-            scaled_brightness = MIN_BRIGHTNESS;
-        } else if scaled_brightness > backlight_max_value {
-            scaled_brightness = backlight_max_value;
-        }
+        let scaled_brightness = filesystem_manager.map_matter_and_ambient_light_to_brightness(matter_brightness, ambient_light_ratio)?;
 
-        // Apply EWMA
-        let smoothed_value = alpha * (scaled_brightness as f32)
-            + (1.0 - alpha) * *prev_smoothed_value;
-        *prev_smoothed_value = smoothed_value;
-
-        info!(
-            "Ambient light sensor: {}, setting brightness to: {}",
-            sensor_value, smoothed_value
+        debug!(
+            "Ambient light sensor: {sensor_value}, smoothed, light sensor value: {smoothed_sensor_value}, setting brightness to: {scaled_brightness}"
         );
 
 
-        if let Err(err) = FilesystemHelpers::write_backlight(smoothed_value as u32) {
+        if let Err(err) = filesystem_manager.write_backlight(scaled_brightness as u32) {
             error!("Error setting backlight for auto brightness: {}", err);
         }
 
@@ -616,7 +833,7 @@ fn auto_brightness_thread_run() {
     }
 
     loop {
-        match loop_runner(&mut prev_smoothed_value) {
+        match loop_runner(&mut prev_smoothed_value, filesystem_manager.clone()) {
             Ok(()) => {
                 ()
             }

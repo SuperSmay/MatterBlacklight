@@ -11,8 +11,6 @@ astro-dnssd = ["rs-matter/astro-dnssd"]
 zeroconf = ["rs-matter/zeroconf"]
 avahi = ["rs-matter/zbus"]
 resolve = ["rs-matter/zbus"]
-chip-test = []
-dry-run = []
 
 [dependencies]
 log = "0.4"
