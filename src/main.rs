@@ -40,6 +40,8 @@ use log::{error, info, debug};
 
 use futures_lite::StreamExt;
 
+use dirs;
+
 use rs_matter::dm::clusters::decl::level_control::{
     AttributeId, CommandId, OptionsBitmap, FULL_CLUSTER as LEVEL_CONTROL_FULL_CLUSTER,
 };
@@ -270,7 +272,7 @@ fn run(filesystem_manager: Arc<FilesystemManager>) -> Result<(), Error> {
 
     // Create, load and run the persister
     let psm = PSM.uninit().init_with(Psm::init());
-    let path = std::env::temp_dir().join("rs-matter");
+    let path = dirs::config_dir().unwrap_or(std::env::temp_dir()).join("rs-matter");
 
     info!(
         "Persist memory: Persist (BSS)={}B, Persist fut (stack)={}B, Persist path={}",
