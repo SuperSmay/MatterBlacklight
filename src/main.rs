@@ -258,7 +258,12 @@ fn run(filesystem_manager: Arc<FilesystemManager>) -> Result<(), Error> {
     // Run the background job of the data model
     let mut dm_job = pin!(dm.run());
 
-    let socket = async_io::Async::<UdpSocket>::bind(MATTER_SOCKET_BIND_ADDR)?;
+    // Create a dual-stack UDP socket for Matter (accepts IPv4 and IPv6)
+    let matter_sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    matter_sock.set_reuse_address(true)?;
+    matter_sock.set_only_v6(false)?;
+    matter_sock.bind(&rs_matter::transport::MATTER_SOCKET_BIND_ADDR.into())?;
+    let socket = async_io::Async::<UdpSocket>::new_nonblocking(matter_sock.into())?;
 
     info!(
         "Transport memory: Transport fut (stack)={}B, mDNS fut (stack)={}B",
@@ -647,8 +652,27 @@ impl OnOffHooks for OnOffDeviceLogic {
     fn set_on_off(&self, on: bool) {
         info!("OnOff state commanded to: {}", on);
         
-        // If ON, set to max_brightness. If OFF, set to 0.
-        let target_brightness = if on { self.max_brightness } else { 0 };
+        // Get the auto brightness level
+        let ambient_light_ratio = match AMBIENT_LIGHT_RATIO.lock() {
+            Ok(value) => *value,
+            Err(_) => 1.0
+        };
+        let matter_ratio = match MATTER_BRIGHTNESS_RATIO.lock() {
+            Ok(value) => *value,
+            Err(_) => {1.0}
+        };
+
+        let target_brightness = if on { 
+            match self.filesystem_manager.map_matter_and_ambient_light_to_brightness(matter_ratio, ambient_light_ratio) {
+                Ok(value) => value as u32,
+                Err(err) => {
+                    error!("Error calculating target brightness for OnOff: {}", err);
+                    self.max_brightness
+                }
+            }
+        } else { 
+            0 
+        };
 
         info!("Backlight value is: {target_brightness}");
 
