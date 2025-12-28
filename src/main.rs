@@ -416,6 +416,10 @@ static MATTER_BRIGHTNESS_RATIO: LazyLock<Mutex<f32>> = LazyLock::new(|| {
     Mutex::new(1.0)
 });
 
+static MATTER_PREV_BRIGHTNESS_RATIO: LazyLock<Mutex<f32>> = LazyLock::new(|| {
+    Mutex::new(1.0)
+});
+
 
 // --- END: Backlight Control Configuration ---
 
@@ -671,13 +675,13 @@ impl OnOffHooks for OnOffDeviceLogic {
             Ok(value) => *value,
             Err(_) => 1.0
         };
-        let matter_ratio = match MATTER_BRIGHTNESS_RATIO.lock() {
+        let prev_matter_ratio = match MATTER_PREV_BRIGHTNESS_RATIO.lock() {
             Ok(value) => *value,
             Err(_) => {1.0}
         };
 
         let target_brightness = if on { 
-            match self.filesystem_manager.map_matter_and_ambient_light_to_brightness(matter_ratio, ambient_light_ratio) {
+            match self.filesystem_manager.map_matter_and_ambient_light_to_brightness(prev_matter_ratio, ambient_light_ratio) {
                 Ok(value) => value as u32,
                 Err(err) => {
                     error!("Error calculating target brightness for OnOff: {}", err);
@@ -685,6 +689,16 @@ impl OnOffHooks for OnOffDeviceLogic {
                 }
             }
         } else { 
+            match MATTER_PREV_BRIGHTNESS_RATIO.lock() {
+                Ok(mut value) => {
+                    let matter_ratio = match MATTER_BRIGHTNESS_RATIO.lock() {
+                        Ok(value) => *value,
+                        Err(_) => {1.0}
+                    };
+                    *value = matter_ratio;
+                },
+                Err(_) => {}
+            };
             0 
         };
 
