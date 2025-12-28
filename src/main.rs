@@ -265,6 +265,20 @@ fn run(filesystem_manager: Arc<FilesystemManager>) -> Result<(), Error> {
     matter_sock.bind(&rs_matter::transport::MATTER_SOCKET_BIND_ADDR.into())?;
     let socket = async_io::Async::<UdpSocket>::new_nonblocking(matter_sock.into())?;
 
+    // Helpful debug logging: print the bound local address and some env vars so we can
+    // diagnose differences when running as root vs a normal user.
+    match socket.get_ref().local_addr() {
+        Ok(addr) => info!("Matter socket local addr: {}", addr),
+        Err(e) => error!("Failed to read matter socket local_addr(): {}", e),
+    }
+
+    info!(
+        "User env: USER='{}' SUDO_USER='{}' (process id={})",
+        env::var("USER").unwrap_or_else(|_| "<unset>".into()),
+        env::var("SUDO_USER").unwrap_or_else(|_| "<unset>".into()),
+        std::process::id()
+    );
+
     info!(
         "Transport memory: Transport fut (stack)={}B, mDNS fut (stack)={}B",
         core::mem::size_of_val(&matter.run(&socket, &socket)),
