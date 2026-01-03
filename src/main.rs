@@ -579,59 +579,17 @@ impl OnOffPersistentState {
 }
 
 pub struct OnOffDeviceLogic {
-    start_up_on_off: Cell<Option<StartUpOnOffEnum>>,
-    storage_path: PathBuf,
-    max_brightness: u32,
     filesystem_manager: Arc<FilesystemManager>,
 }
-
-const STORAGE_FILE_NAME: &str = "rs-matter-on-off-state";
 
 impl OnOffDeviceLogic {
     pub fn new(filesystem_manager: Arc<FilesystemManager>) -> Self {
         let max_brightness = filesystem_manager.get_max_backlight().unwrap_or(255);
         info!("Max Backlight Brightness Detected: {}", max_brightness);
 
-        let storage_path = std::env::temp_dir().join(STORAGE_FILE_NAME);
-        info!(
-            "OnOffDeviceLogic using storage path: {}",
-            storage_path.as_path().to_str().unwrap_or("none")
-        );
-
-        let persisted_state = match fs::File::open(storage_path.as_path()) {
-            Ok(mut file) => {
-                let mut buf: [u8; 1] = [0];
-                file.read_exact(&mut buf).unwrap();
-                OnOffPersistentState::from_bytes(buf[0]).unwrap()
-            }
-            Err(_) => OnOffPersistentState::default(),
-        };
-
         Self {
-            start_up_on_off: Cell::new(persisted_state.start_up_on_off),
-            storage_path,
-            max_brightness,
             filesystem_manager,
         }
-    }
-
-    
-
-    fn save_state(&self) -> Result<(), Error> {
-        let mut file = fs::File::create(self.storage_path.as_path())?;
-
-        // Use a dummy 'on_off' value (false) as the real on/off is derived from backlight level.
-        // We only persist the `start_up_on_off`.
-        let value = OnOffPersistentState::to_bytes_from_values(
-            false, 
-            self.start_up_on_off.get(),
-        );
-
-        let buf = &[value];
-
-        file.write_all(buf)?;
-
-        Ok(())
     }
 
 }
@@ -685,7 +643,7 @@ impl OnOffHooks for OnOffDeviceLogic {
                 Ok(value) => value as u32,
                 Err(err) => {
                     error!("Error calculating target brightness for OnOff: {}", err);
-                    self.max_brightness
+                    0
                 }
             }
         } else { 
@@ -708,21 +666,29 @@ impl OnOffHooks for OnOffDeviceLogic {
             error!("Error setting backlight for OnOff: {}", err);
         }
 
-        if let Err(err) = self.save_state() {
-            error!("Error saving state: {}", err);
-        }
     }
 
     fn start_up_on_off(&self) -> Nullable<on_off::StartUpOnOffEnum> {
-        match self.start_up_on_off.get() {
-            Some(value) => Nullable::some(value),
-            None => Nullable::none(),
+        match self.filesystem_manager.read_backlight() {
+            Ok(brightness) => {
+                let on_off = brightness > 0;
+                info!("OnOff start_up_on_off read backlight brightness: {}, interpreted as OnOff: {}", brightness, on_off);
+                return Nullable::some(if on_off {
+                    StartUpOnOffEnum::On
+                } else {
+                    StartUpOnOffEnum::Off
+                });
+            },
+            Err(e) => {
+                error!("Error reading backlight for OnOff start_up_on_off: {:?}", e);
+                return Nullable::some(StartUpOnOffEnum::Off)
+            }
         }
     }
 
-    fn set_start_up_on_off(&self, value: Nullable<on_off::StartUpOnOffEnum>) -> Result<(), Error> {
-        self.start_up_on_off.set(value.into_option());
-        self.save_state()
+    fn set_start_up_on_off(&self, _value: Nullable<on_off::StartUpOnOffEnum>) -> Result<(), Error> {
+        // We are just reading the state from the backlight file, so no need to store this
+        Ok(())
     }
 
     async fn handle_off_with_effect(&self, _effect: on_off::EffectVariantEnum) {
@@ -731,7 +697,7 @@ impl OnOffHooks for OnOffDeviceLogic {
 }
 
 // Filesystem helpers
-struct FilesystemManager {
+pub struct FilesystemManager {
     no_filesystem: bool,
 }
 
@@ -837,6 +803,11 @@ impl FilesystemManager {
         }
 
         Ok(scaled_brightness)
+    }
+
+    fn get_on_off_state(&self) -> Result<bool, Error> {
+        let brightness = self.read_backlight()?;
+        Ok(brightness > 0)
     }
 }
 
