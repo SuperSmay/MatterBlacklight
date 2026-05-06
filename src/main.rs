@@ -514,12 +514,19 @@ impl LevelControlHooks for LevelControlDeviceLogic {
     }
 
     fn current_level(&self) -> Option<u8> {
+        // 1. Check the logical On/Off state first.
+        // If the light is OFF, report 0 to the controller.
+        if !IS_LIGHT_ON.load(Ordering::SeqCst) {
+            return Some(0);
+        }
+
+        // 2. If it is ON, return the actual ratio stored.
         match MATTER_BRIGHTNESS_RATIO.lock() {
-            Ok(brightness) => {
-                Some((*brightness * 254.0) as u8)
+            Ok(ratio) => {
+                Some((*ratio * 254.0) as u8)
             },
             Err(e) => {
-                error!("Error reading current backlight brightness: {:?}", e);
+                error!("Error reading current matter brightness ratio: {:?}", e);
                 None
             }
         }
