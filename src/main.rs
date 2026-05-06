@@ -156,21 +156,34 @@ fn main() -> Result<(), Error> {
         .spawn(move || run(matter_filesystem_manager.clone()))
         .unwrap();
 
-    // Wait on Matter thread, then if it crashes, just run the auto brightness thread forever
-    match thread.join() {
-        Ok(_) => running.store(false, Ordering::SeqCst),
+
+    // Wait on the Matter thread
+    let matter_result = thread.join();
+
+    // Signal the auto-brightness thread to stop
+    running.store(false, Ordering::SeqCst);
+
+    match matter_result {
+        Ok(Ok(_)) => info!("Matter thread exited gracefully."),
+        Ok(Err(e)) => {
+            error!("Matter thread returned an error: {:?}", e);
+            // Exit the process with an error code
+            std::process::exit(1);
+        }
         Err(e) => {
-            error!("Matter thread exited with error: {:?}", e);
+            error!("Matter thread panicked: {:?}", e);
+            // Exit the process immediately on panic
+            std::process::exit(1);
         }
     }
 
-    match auto_brightness_thread.join() {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            error!("Auto brightness thread exited with error: {:?}", e);
-            Err(Error::from(ErrorCode::Failure))
-        }
+    // Attempt to join the auto-brightness thread for a clean cleanup
+    if let Err(e) = auto_brightness_thread.join() {
+        error!("Auto brightness thread panicked during shutdown: {:?}", e);
+        std::process::exit(1);
     }
+
+    Ok(())
 
 }
 
