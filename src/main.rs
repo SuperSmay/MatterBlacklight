@@ -86,6 +86,7 @@ static MATTER: StaticCell<Matter> = StaticCell::new();
 static BUFFERS: StaticCell<PooledBuffers<10, NoopRawMutex, IMBuffer>> = StaticCell::new();
 static SUBSCRIPTIONS: StaticCell<DefaultSubscriptions> = StaticCell::new();
 static PSM: StaticCell<Psm<4096>> = StaticCell::new();
+static IS_LIGHT_ON: AtomicBool = AtomicBool::new(true);
 
 fn main() -> Result<(), Error> {
 
@@ -415,12 +416,6 @@ static AMBIENT_LIGHT_RATIO: LazyLock<Mutex<f32>> = LazyLock::new(|| {
 static MATTER_BRIGHTNESS_RATIO: LazyLock<Mutex<f32>> = LazyLock::new(|| {
     Mutex::new(1.0)
 });
-
-static MATTER_PREV_BRIGHTNESS_RATIO: LazyLock<Mutex<f32>> = LazyLock::new(|| {
-    Mutex::new(1.0)
-});
-
-
 // --- END: Backlight Control Configuration ---
 
 
@@ -491,7 +486,7 @@ impl LevelControlHooks for LevelControlDeviceLogic {
             Ok(value) => *value,
             Err(_) => 1.0
         };
-        let matter_ratio = level as f32/255.0;
+        let matter_ratio = level as f32/254.0;
         // Store the ratio for the auto brightness part to use
         match MATTER_BRIGHTNESS_RATIO.lock() {
             Ok(mut value) => *value = matter_ratio,
@@ -521,7 +516,7 @@ impl LevelControlHooks for LevelControlDeviceLogic {
     fn current_level(&self) -> Option<u8> {
         match MATTER_BRIGHTNESS_RATIO.lock() {
             Ok(brightness) => {
-                Some((*brightness * 255.0) as u8)
+                Some((*brightness * 254.0) as u8)
             },
             Err(e) => {
                 error!("Error reading current backlight brightness: {:?}", e);
@@ -584,56 +579,31 @@ impl OnOffHooks for OnOffBacklightDeviceLogic {
         ));
 
     fn on_off(&self) -> bool {
-        match self.filesystem_manager.read_backlight() {
-            Ok(brightness) => brightness > 0,
-            Err(e) => {
-                error!("Error reading backlight for OnOff state: {:?}", e);
-                false
-            }
-        }
+        IS_LIGHT_ON.load(Ordering::SeqCst)
     }
 
     fn set_on_off(&self, on: bool) {
         info!("OnOff state commanded to: {}", on);
+        IS_LIGHT_ON.store(on, Ordering::SeqCst);
         
-        // Get the auto brightness level
-        let ambient_light_ratio = match AMBIENT_LIGHT_RATIO.lock() {
-            Ok(value) => *value,
-            Err(_) => 1.0
-        };
-        let prev_matter_ratio = match MATTER_PREV_BRIGHTNESS_RATIO.lock() {
-            Ok(value) => *value,
-            Err(_) => {1.0}
-        };
-
-        let target_brightness = if on { 
-            match self.filesystem_manager.map_matter_and_ambient_light_to_brightness(prev_matter_ratio, ambient_light_ratio) {
-                Ok(value) => value as u32,
-                Err(err) => {
-                    error!("Error calculating target brightness for OnOff: {}", err);
-                    0
-                }
-            }
-        } else { 
-            match MATTER_PREV_BRIGHTNESS_RATIO.lock() {
-                Ok(mut value) => {
-                    let matter_ratio = match MATTER_BRIGHTNESS_RATIO.lock() {
-                        Ok(value) => *value,
-                        Err(_) => {1.0}
-                    };
-                    *value = matter_ratio;
-                },
-                Err(_) => {}
+        if on {
+            // Restore brightness based on current Matter ratio
+            let matter_ratio = match MATTER_BRIGHTNESS_RATIO.lock() {
+                Ok(value) => *value,
+                Err(_) => 1.0,
             };
-            0 
-        };
+            let ambient_ratio = match AMBIENT_LIGHT_RATIO.lock() {
+                Ok(value) => *value,
+                Err(_) => 1.0,
+            };
 
-        info!("Backlight value is: {target_brightness}");
-
-        if let Err(err) = self.filesystem_manager.write_backlight(target_brightness) {
-            error!("Error setting backlight for OnOff: {}", err);
+            if let Ok(brightness) = self.filesystem_manager.map_matter_and_ambient_light_to_brightness(matter_ratio, ambient_ratio) {
+                let _ = self.filesystem_manager.write_backlight(brightness as u32);
+            }
+        } else {
+            // Turn off hardware
+            let _ = self.filesystem_manager.write_backlight(0);
         }
-
     }
 
     fn start_up_on_off(&self) -> Nullable<on_off::StartUpOnOffEnum> {
@@ -753,7 +723,7 @@ impl FilesystemManager {
 
     fn map_matter_and_ambient_light_to_brightness(&self, matter_ratio: f32, ambient_light_ratio: f32) -> Result<f32, Error> {
 
-        if matter_ratio <= 0.0 {
+        if matter_ratio <= 0.0 || IS_LIGHT_ON.load(Ordering::Relaxed) == false {
             return Ok(0.0);
         }
 
