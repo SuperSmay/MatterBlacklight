@@ -228,7 +228,7 @@ fn run(filesystem_manager: Arc<FilesystemManager>) -> Result<(), Error> {
 
     // OnOff cluster setup
     let on_off_handler =
-        on_off::OnOffHandler::new(Dataver::new_rand(matter.rand()), 1, OnOffDeviceLogic::new(filesystem_manager.clone()));
+        on_off::OnOffHandler::new(Dataver::new_rand(matter.rand()), 1, OnOffBacklightDeviceLogic::new(filesystem_manager.clone()));
 
     // Cluster wiring, validation and initialisation
     on_off_handler.init(Some(&level_control_handler));
@@ -342,7 +342,7 @@ const NODE: Node<'static> = Node {
             device_types: devices!(DEV_TYPE_DIMMABLE_LIGHT),
             clusters: clusters!(
                 desc::DescHandler::CLUSTER,
-                OnOffDeviceLogic::CLUSTER,
+                OnOffBacklightDeviceLogic::CLUSTER,
                 LevelControlDeviceLogic::CLUSTER,
             ),
         },
@@ -371,7 +371,7 @@ fn dm_handler<'a, LH: LevelControlHooks, OH: OnOffHooks>(
                         Async(desc::DescHandler::new(Dataver::new_rand(matter.rand())).adapt()),
                     )
                     .chain(
-                        EpClMatcher::new(Some(1), Some(OnOffDeviceLogic::CLUSTER.id)),
+                        EpClMatcher::new(Some(1), Some(OnOffBacklightDeviceLogic::CLUSTER.id)),
                         on_off::HandlerAsyncAdaptor(on_off),
                     ).chain(
                         EpClMatcher::new(Some(1), Some(LevelControlDeviceLogic::CLUSTER.id)),
@@ -546,43 +546,11 @@ impl LevelControlHooks for LevelControlDeviceLogic {
 }
 
 // Implementing the OnOff business logic
-#[derive(Default)]
-struct OnOffPersistentState {
-    on_off: bool,
-    start_up_on_off: Option<StartUpOnOffEnum>,
-}
-
-impl OnOffPersistentState {
-    fn to_bytes_from_values(on_off: bool, start_up_on_off: Option<StartUpOnOffEnum>) -> u8 {
-        let on_off = on_off as u8;
-        let start_up_on_off: u8 = match start_up_on_off {
-            Some(StartUpOnOffEnum::Off) => 0,
-            Some(StartUpOnOffEnum::On) => 1,
-            Some(StartUpOnOffEnum::Toggle) => 2,
-            None => 3,
-        };
-        on_off + (start_up_on_off << 1)
-    }
-
-    fn from_bytes(data: u8) -> Result<Self, Error> {
-        Ok(Self {
-            on_off: data & 1 != 0,
-            start_up_on_off: match data >> 1 {
-                0 => Some(StartUpOnOffEnum::Off),
-                1 => Some(StartUpOnOffEnum::On),
-                2 => Some(StartUpOnOffEnum::Toggle),
-                3 => None,
-                _ => return Err(rs_matter::error::Error::from(ErrorCode::Failure)),
-            },
-        })
-    }
-}
-
-pub struct OnOffDeviceLogic {
+pub struct OnOffBacklightDeviceLogic {
     filesystem_manager: Arc<FilesystemManager>,
 }
 
-impl OnOffDeviceLogic {
+impl OnOffBacklightDeviceLogic {
     pub fn new(filesystem_manager: Arc<FilesystemManager>) -> Self {
         let max_brightness = filesystem_manager.get_max_backlight().unwrap_or(255);
         info!("Max Backlight Brightness Detected: {}", max_brightness);
@@ -594,7 +562,7 @@ impl OnOffDeviceLogic {
 
 }
 
-impl OnOffHooks for OnOffDeviceLogic {
+impl OnOffHooks for OnOffBacklightDeviceLogic {
     const CLUSTER: Cluster<'static> = on_off_cluster::FULL_CLUSTER
         .with_revision(6)
         .with_features(on_off_cluster::Feature::LIGHTING.bits())
